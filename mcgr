@@ -1,0 +1,319 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+#
+# Dependencies (on Ubuntu):
+# - python-wnck
+#
+
+# If using on Compiz, set General Settings / Focus Stealing Prevention
+# to None
+
+from optparse import OptionParser
+import logging
+import gtk
+import wnck
+import cPickle as pickle
+from os import stat, remove, mkfifo
+import re
+import os
+from time import time, sleep
+from stat import S_ISFIFO
+from os.path import exists
+from itertools import dropwhile
+from collections import defaultdict
+try:
+    import pygtk
+    pygtk.require('2.0')
+    import pynotify
+except ImportError:
+    pynotify = None
+    print "Can't import pynotify"
+
+# get largest Xinerama screen
+from Xlib.display import Display
+display = Display()
+
+class WNCK_WINDOW:
+    CHANGE_X      = 1 << 0
+    CHANGE_Y      = 1 << 1
+    CHANGE_WIDTH  = 1 << 2
+    CHANGE_HEIGHT = 1 << 3
+
+FIFO_PATH = '/tmp/mcgr.fifo'
+
+
+def flush_events():
+    while gtk.events_pending():
+        gtk.main_iteration()
+
+
+def get_timestamp():
+    return int(time())
+
+
+def get_window_class(w):
+    xid = w.get_xid()
+    gw = gtk.gdk.window_foreign_new(xid)
+    class_tuple = gw.property_get('WM_CLASS')
+    if class_tuple is None:
+        return None
+    class_str = class_tuple[2]
+    _, cls = class_str.split('\x00')[:2]
+    return cls
+
+
+def matches(wm_class, pattern):
+    if wm_class is None:
+        return False
+    if pattern.startswith('/') and pattern.endswith('/'):
+        return re.search(pattern[1:-1], wm_class)
+    else:
+        return wm_class == pattern
+
+
+class Screen(object):
+    def __init__(self, screen):
+        self.screen = screen
+
+    @classmethod
+    def get_default(cls):
+        _screen = wnck.screen_get_default()
+        flush_events()
+        return cls(_screen)
+
+    def get_current_ws(self):
+        return self.screen.get_active_workspace()
+
+    def get_workspace(self, n):
+        return self.screen.get_workspace(n)
+
+    def get_app_windows(self):
+        return self.screen.get_windows()
+
+    def iter_app_windows_by_class(self, wm_class):
+        return (w for w in self.get_app_windows()
+                if matches(get_window_class(w), wm_class))
+
+
+def test():
+    from doctest import testmod
+    testmod()
+
+
+class WmClassManager(list):
+    """
+    Keep track of
+     * open windows
+     * last access time
+    for a given window class.
+    """
+    def __init__(self):
+        super(WmClassManager, self).__init__()
+        self.timer = None
+        self.restart_timer()
+
+    def index(self, app_window):
+        try:
+            return super(WmClassManager, self).index(app_window)
+        except ValueError:
+            return -1
+
+    def update(self, app_windows):
+        self[:] = sorted(app_windows, key=lambda w: self.index(w))
+
+    def restart_timer(self):
+        self.timer = time()
+
+
+class Switcher(object):
+
+    def __init__(self):
+        self.wm_classes = defaultdict(WmClassManager)
+
+    def do_unknown(self, *args, **kwargs):
+        logging.error('Uknown action %(original_action)s' % kwargs)
+
+    def do_tile_horizontally(self, edge, dividend, divisor, **kwargs):
+        xinerama_screen = sorted(display.xinerama_query_screens().screens,
+                                 key=lambda screen: -screen.width)[0]
+        screen = Screen.get_default().screen
+        current_window = screen.get_active_window()
+        ws = screen.get_active_workspace()
+        if current_window:
+            current_window.unmaximize()
+            current_window.maximize_vertically()
+            width = xinerama_screen.width
+            current_window.set_geometry(
+                wnck.WINDOW_GRAVITY_NORTHWEST,
+                WNCK_WINDOW.CHANGE_X | WNCK_WINDOW.CHANGE_WIDTH,
+                xinerama_screen.x + edge * (
+                    width - dividend * width // divisor),
+                0,
+                dividend * width // divisor,
+                0)
+
+    def do_tile_half_left(self, **kwargs):
+        self.do_tile_horizontally(0, 1, 2)
+
+    def do_tile_half_right(self, **kwargs):
+        self.do_tile_horizontally(1, 1, 2)
+
+    def do_tile_two_thirds_left(self, **kwargs):
+        self.do_tile_horizontally(0, 2, 3)
+
+    def do_tile_two_thirds_right(self, **kwargs):
+        self.do_tile_horizontally(1, 2, 3)
+
+    def do_goto_or_run(self, wm_class, *cmdline, **kwargs):
+        logging.debug('received WM_CLASS: %s, command line: %s',
+                      wm_class, ' '.join(cmdline))
+        screen = Screen.get_default()
+        logging.debug('getting app windows with class %s', wm_class)
+        app_windows = list(screen.iter_app_windows_by_class(wm_class))
+        logging.debug('found %d windows, getting xids...', len(app_windows))
+        app_window_xids = [w.get_xid() for w in app_windows]
+        logging.debug('found app windows of class %s with xids %r',
+                      wm_class, app_window_xids)
+        manager = self.wm_classes[wm_class]
+        manager.update(app_window_xids)
+        logging.debug('manager now: %r', manager)
+        app_window_dict = dict((w.get_xid(), w) for w in app_windows)
+        if not manager:
+            from subprocess import Popen
+            self.notify(wm_class, '$ %s' % ' '.join(cmdline), icon=cmdline[0])
+            logging.info('executing: %s', ' '.join(cmdline))
+            try:
+                Popen(cmdline)
+            except OSError, e:
+                self.notify(' '.join(cmdline), unicode(e))
+                logging.error('%s: %s', e, cmdline)
+                # raise OSError('%s: %s' % (e, cmdline))
+        else:
+            logging.info('switching to: %s', wm_class)
+            manager.sort(key=lambda w: app_window_dict[w].is_active())
+            if manager.timer - time() < 1.0 or len(manager) == 1:
+                xid = manager[0]
+            else:
+                xid = manager[-2]
+            index = app_window_xids.index(xid)
+            w = app_window_dict[xid]
+            manager.restart_timer()
+            logging.debug('found windows: %r',
+                          [app_window_dict[aw].get_name() for aw in manager])
+            ws = w.get_workspace()
+            logging.debug('workspace of %r: %r', w.get_name(), ws)
+            # workspace is None for pinned windows
+            if ws is not None:
+                logging.debug('activating %r', ws)
+                #ws.activate(get_timestamp())
+                ws.activate(0)
+            sleep(.01)
+            flush_events()
+            gw = gtk.gdk.window_foreign_new(w.get_xid())
+            logging.debug('gw.get_state() == %r', gw.get_state())
+            logging.debug('gw.get_window_type() == %r', gw.get_window_type())
+            logging.debug('focusing %r', gw)
+            self.notify(wm_class,
+                        '%d/%d' % (index + 1, len(app_window_xids)),
+                        icon=cmdline[0])
+            gw.focus()
+            flush_events()
+
+    def notify(self, title, text, icon='user-desktop'):
+        if self.notification:
+            self.notification.update(title, text, icon)
+            if not self.notification.show():
+                logging.error('Failed to show notification')
+
+    def init_notification(self):
+        self.notification = None
+        if pynotify:
+            logging.debug('Initializing pynotify')
+            if pynotify.init('metacity_goto_or_run'):
+                self.notification = pynotify.Notification(
+                    'mcgr started', 'daemon waiting for fifo input')
+                self.notification.show()
+            else:
+                logging.error('Failed to initialize pynotify')
+
+    def serve(self):
+        self.init_notification()
+        if exists(FIFO_PATH) and not S_ISFIFO(stat(FIFO_PATH).st_mode):
+            logging.debug('Removing non-fifo %s', FIFO_PATH)
+            remove(FIFO_PATH)
+        if not exists(FIFO_PATH):
+            logging.debug('Creating %s', FIFO_PATH)
+            mkfifo(FIFO_PATH)
+
+        def read_fifo(blocking=True):
+            fifo = os.open(FIFO_PATH,
+                           os.O_RDONLY | (not blocking and os.O_NONBLOCK))
+            buf = ['']
+            while True:
+                newbuf = os.read(fifo, 256).split('\n')
+                if newbuf == ['']:
+                    if buf[-1] == '':
+                        os.close(fifo)
+                        return buf
+                    sleep(1)
+                buf[-1] += newbuf[0]
+                buf.extend(newbuf[1:])
+
+        logging.debug('Flushing fifo')
+        buf = read_fifo(blocking=False)[-2:]
+        while True:
+            logging.debug('Executing from fifo %r', buf)
+            while len(buf) > 1:
+                line = buf.pop(0)
+                parts = line.strip().split()
+                action = parts[0].replace('-', '_')
+                meth = getattr(self, 'do_%s' % action, self.do_unknown)
+                logging.debug('%s: %s' % (action, ' '.join(parts[1:])))
+                meth(*parts[1:], **{'original_action': parts[0]})
+            assert buf == ['']
+            buf = read_fifo(blocking=True)
+
+    def cleanup_server(self):
+        if exists(FIFO_PATH):
+            remove(FIFO_PATH)
+
+    @classmethod
+    def load(cls, filepath='/tmp/metacity_goto_or_run.state'):
+        try:
+            return pickle.load(file(filepath))
+        except (IOError, KeyError, ValueError):
+            return cls()
+
+
+def main():
+    p = OptionParser()
+    p.add_option('-u', '--unittest', action='store_true')
+    p.add_option('-v', '--verbose', action='count')
+    p.add_option('-d', '--daemon', action='store_true')
+    p.disable_interspersed_args()
+    (opts, args) = p.parse_args()
+
+    loglevel = 40 - 10 * (opts.verbose or 0)
+    logging.basicConfig(level=loglevel, format='%(levelname)-8s %(message)s')
+
+    if opts.unittest:
+        test()
+
+    elif opts.daemon:
+        switcher = Switcher()
+        try:
+            switcher.serve()
+        finally:
+            switcher.cleanup_server()
+
+    else:
+        wm_class = args[0]
+        cmdline = args[1:]
+        switcher = Switcher.load()
+        switcher.main(wm_class, cmdline)
+        pickle.dump(switcher, file('/tmp/metacity_goto_or_run.state', 'w'))
+
+
+if __name__ == '__main__':
+    main()
