@@ -5,7 +5,7 @@
 mcgr
 ====
 
-Mcgr[1]_ provides hot-key access for
+Mcgr [1]_ provides hot-key access for
 
  * launching applications
 
@@ -15,6 +15,10 @@ Mcgr[1]_ provides hot-key access for
 
 Once run, the `mcgr` script accepts the followig commands through the
 `/tmp/mcgr.fifo` FIFO:
+
+
+.. [1] originally named for "MetaCity Go to or Run", now works with other window
+   managers as well)
 
 goto-or-run <WM_CLASS> <commandline>
 ------------------------------------
@@ -35,6 +39,3 @@ Example:
 In GNOME key bindings use e.g.:
 
     sh -c "[ -p /tmp/mcgr.fifo ] && echo Firefox firefox -P profilename >>/tmp/mcgr.fifo" 
-
-.. [1] originally named for "MetaCity Go to or Run", now works with other window
-   managers as well)
