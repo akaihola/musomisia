@@ -307,6 +307,7 @@ def main():
 
     loglevel = 40 - 10 * (opts.verbose or 0)
     logging.basicConfig(level=loglevel, format='%(levelname)-8s %(message)s')
+    logging.debug('Starting mcgr...')
 
     if opts.unittest:
         test()
