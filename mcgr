@@ -4,6 +4,7 @@
 #
 # Dependencies (on Ubuntu):
 # - python-wnck
+# - python-xlib
 #
 
 # If using on Compiz, set General Settings / Focus Stealing Prevention
