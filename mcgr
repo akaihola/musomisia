@@ -252,7 +252,17 @@ class Switcher(object):
                            os.O_RDONLY | (not blocking and os.O_NONBLOCK))
             buf = ['']
             while True:
-                newbuf = os.read(fifo, 256).split('\n')
+                try:
+                    newbuf = os.read(fifo, 256).split('\n')
+                except OSError as e:
+                    if e.errno == 11:
+                        # resource temporarily unavailable
+                        # i.e. EAGAIN or EWOULDBLOCK
+                        logging.warning(e)
+                        logging.warning('Retrying to read FIFO in 1 second...')
+                        sleep(1)
+                        continue
+                    raise
                 if newbuf == ['']:
                     if buf[-1] == '':
                         os.close(fifo)
